@@ -1,0 +1,8 @@
+earthengine-api
+pandas
+numpy
+scikit-learn
+imbalanced-learn
+folium
+matplotlib
+seaborn

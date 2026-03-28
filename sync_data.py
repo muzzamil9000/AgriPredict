@@ -1,32 +1,41 @@
-
 import ee
-import pandas as pd
-import numpy as np
-from datetime import datetime, timedelta
 import os
 import json
+import pandas as pd
+from datetime import datetime, timedelta
 
 # ==========================================
-# 1. GEE AUTHENTICATION (The "Bot" Login)
+# 1. FORCE SERVICE ACCOUNT LOGIN
 # ==========================================
-# Change this to your actual Service Account Email!
-SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
+# IMPORTANT: Put your EXACT Service Account Email below!
+# You can find this in your JSON file under "client_email"
+EE_SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
 
 def initialize_gee():
+    # GitHub Actions sets the 'GEE_KEY' environment variable
     gee_key_json = os.environ.get('GEE_KEY')
+    
     if gee_key_json:
-        # Running in GitHub Actions
+        print("🤖 Running in GitHub Cloud: Using Service Account...")
+        # 1. Parse the JSON key from the secret
         key_dict = json.loads(gee_key_json)
-        credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, key_data=gee_key_json)
+        
+        # 2. Authenticate using the Service Account
+        credentials = ee.ServiceAccountCredentials(
+            email=EE_SERVICE_ACCOUNT,
+            key_data=gee_key_json
+        )
+        
+        # 3. Initialize with specific project ID
         ee.Initialize(credentials, project='ee-muzzamilgandapur007')
-        print("✅ GEE Initialized via GitHub Actions (Service Account)")
+        print("✅ GEE Service Account Login Successful!")
     else:
-        # Running locally on your computer
+        print("💻 Running locally: Using personal login...")
+        # This is for your PC only
         ee.Initialize(project='ee-muzzamilgandapur007')
-        print("✅ GEE Initialized locally")
 
+# Run the initialization
 initialize_gee()
-
 # ==========================================
 # 2. DATA GAP CHECKING
 # ==========================================

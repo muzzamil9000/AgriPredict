@@ -12,29 +12,15 @@ from datetime import datetime, timedelta
 EE_SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
 
 def initialize_gee():
-    # GitHub Actions sets the 'GEE_KEY' environment variable
     gee_key_json = os.environ.get('GEE_KEY')
-    
     if gee_key_json:
         print("🤖 Running in GitHub Cloud: Using Service Account...")
-        # 1. Parse the JSON key from the secret
-        key_dict = json.loads(gee_key_json)
-        
-        # 2. Authenticate using the Service Account
-        credentials = ee.ServiceAccountCredentials(
-            email=EE_SERVICE_ACCOUNT,
-            key_data=gee_key_json
-        )
-        
-        # 3. Initialize with specific project ID
+        credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, key_data=gee_key_json)
         ee.Initialize(credentials, project='ee-muzzamilgandapur007')
-        print("✅ GEE Service Account Login Successful!")
     else:
-        print("💻 Running locally: Using personal login...")
-        # This is for your PC only
+        print("💻 Running locally...")
         ee.Initialize(project='ee-muzzamilgandapur007')
 
-# Run the initialization
 initialize_gee()
 # ==========================================
 # 2. DATA GAP CHECKING

@@ -5,10 +5,8 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. FORCE SERVICE ACCOUNT LOGIN
+# 1. AUTHENTICATION LOGIC (WORKING!)
 # ==========================================
-# IMPORTANT: Put your EXACT Service Account Email below!
-# You can find this in your JSON file under "client_email"
 EE_SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
 
 def initialize_gee():
@@ -17,41 +15,54 @@ def initialize_gee():
         print("🤖 Running in GitHub Cloud: Using Service Account...")
         credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, key_data=gee_key_json)
         ee.Initialize(credentials, project='ee-muzzamilgandapur007')
+        print("✅ GEE Login Successful!")
     else:
         print("💻 Running locally...")
         ee.Initialize(project='ee-muzzamilgandapur007')
 
 initialize_gee()
+
 # ==========================================
-# 2. DATA GAP CHECKING
+# 2. DATA GAP CHECKING (FIXED FOR KEYERROR)
 # ==========================================
 master_path = 'Master_Data.csv'
+
 if os.path.exists(master_path):
+    print(f"📄 Loading {master_path}...")
     df_master = pd.read_csv(master_path)
-    df_master['date'] = pd.to_datetime(df_master['date'])
-    # Find the day after the last record
-    start_date = (df_master['date'].max() + timedelta(days=1)).strftime('%Y-%m-%d')
+    
+    # Standardize columns to lowercase to avoid 'Date' vs 'date' issues
+    df_master.columns = [c.lower() for c in df_master.columns]
+    
+    if not df_master.empty and 'date' in df_master.columns:
+        df_master['date'] = pd.to_datetime(df_master['date'])
+        start_date = (df_master['date'].max() + timedelta(days=1)).strftime('%Y-%m-%d')
+        print(f"✅ Last record found: {df_master['date'].max().date()}")
+    else:
+        print("⚠️ File is empty or 'date' column is missing. Starting from 2018.")
+        start_date = '2018-01-01'
 else:
+    print("📁 Master_Data.csv not found. Creating a new one from 2018.")
     df_master = pd.DataFrame()
     start_date = '2018-01-01'
 
 end_date = datetime.now().strftime('%Y-%m-%d')
 
 if start_date >= end_date:
-    print("✅ No new data found. Master_Data is already current.")
+    print("✅ No new data needed. System is up to date.")
     exit()
 
-print(f"📡 Syncing missing data from {start_date} to {end_date}...")
+print(f"📡 Syncing data from {start_date} to {end_date}...")
 
 # ==========================================
-# 3. GEE PIXEL EXTRACTION LOGIC
+# 3. GEE DATA EXTRACTION (THE "PULL")
 # ==========================================
 def get_new_data(start, end):
     region = ee.Geometry.Rectangle([33.5, -1.5, 36.5, 1.5])
     landcover = ee.Image("ESA/WorldCover/v100/2020")
     cropland = landcover.eq(40)
     
-    # Use fixed seed=42 to always get the exact SAME 1200 points
+    # Fixed seed ensures we track the SAME farms every time
     points = cropland.selfMask().stratifiedSample(
         numPoints=1200, region=region, scale=30, geometries=True, seed=42
     )
@@ -62,22 +73,16 @@ def get_new_data(start, end):
         .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
 
     if s2Col.size().getInfo() == 0:
-        print("☁️ Sky too cloudy or no new images yet.")
         return pd.DataFrame()
 
-    # This function processes each image and returns features
     def extract_stats(img):
-        # Indices
-        ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
-        savi = img.expression('((N-R)/(N+R+0.5))*1.5', {'N':img.select('B8'),'R':img.select('B4')}).rename('SAVI')
-        
-        # Weather
+        ndvi = img.normalizedDifference(['B8', 'B4']).rename('ndvi')
         date = img.date()
-        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('Rainfall')
+        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('rainfall')
         weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(date, date.advance(1,'day')).mean()
-        temp = weather.select('temperature_2m').subtract(273.15).rename('Temp')
+        temp = weather.select('temperature_2m').subtract(273.15).rename('temp')
         
-        combined = img.addBands([ndvi, savi, rain, temp])
+        combined = img.addBands([ndvi, rain, temp])
         
         def reduce_point(pt):
             stats = combined.reduceRegion(reducer=ee.Reducer.mean(), geometry=pt.geometry(), scale=30)
@@ -85,42 +90,44 @@ def get_new_data(start, end):
                 'date': date.format('YYYY-MM-DD'),
                 'point_id': pt.id()
             })
-        
         return points.map(reduce_point)
 
-    # Flatten the collection
     results = s2Col.map(extract_stats).flatten()
+    clean_results = results.filter(ee.Filter.notNull(['ndvi', 'rainfall', 'temp']))
     
-    # Filter out empty results
-    clean_results = results.filter(ee.Filter.notNull(['NDVI', 'Rainfall', 'Temp']))
-    
-    # Convert GEE FeatureCollection to list of dicts for Pandas
+    # Check if there are any results to avoid errors
+    if clean_results.size().getInfo() == 0:
+        return pd.DataFrame()
+
     features = clean_results.getInfo()['features']
     data_list = []
     for f in features:
         props = f['properties']
-        # Add .geo if needed for mapping
         props['.geo'] = json.dumps(f['geometry'])
         data_list.append(props)
     
     return pd.DataFrame(data_list)
 
 # ==========================================
-# 4. EXECUTION & AUTO-SAVE
+# 4. EXECUTION
 # ==========================================
 try:
     new_df = get_new_data(start_date, end_date)
     
     if not new_df.empty:
-        # Merge with existing data
+        # Standardize new data columns to match master
+        new_df.columns = [c.lower() for c in new_df.columns]
+        
         updated_master = pd.concat([df_master, new_df], ignore_index=True)
-        # Ensure year column is set correctly
         updated_master['year'] = pd.to_datetime(updated_master['date']).dt.year
-        # Save
+        
+        # Remove any duplicates that might have sneaked in
+        updated_master = updated_master.drop_duplicates(subset=['point_id', 'date'])
+        
         updated_master.to_csv(master_path, index=False)
-        print(f"✅ Master_Data updated with {len(new_df)} new records!")
+        print(f"🚀 SUCCESS: {len(new_df)} new records added to Master_Data.csv")
     else:
-        print("ℹ️ No processable images found for this period.")
+        print("ℹ️ No new clear images found for this period.")
 
 except Exception as e:
-    print(f"❌ Error during sync: {e}")
+    print(f"❌ ERROR: {e}")

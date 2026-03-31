@@ -5,64 +5,60 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. AUTHENTICATION LOGIC (WORKING!)
+# 1. AUTHENTICATION (The "Bot" Login)
 # ==========================================
 EE_SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
 
 def initialize_gee():
     gee_key_json = os.environ.get('GEE_KEY')
     if gee_key_json:
-        print("🤖 Running in GitHub Cloud: Using Service Account...")
+        print("🤖 CLOUD MODE: Service Account Key detected.")
         credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, key_data=gee_key_json)
         ee.Initialize(credentials, project='ee-muzzamilgandapur007')
-        print("✅ GEE Login Successful!")
     else:
-        print("💻 Running locally...")
+        print("💻 LOCAL MODE: Using personal login...")
         ee.Initialize(project='ee-muzzamilgandapur007')
 
 initialize_gee()
 
 # ==========================================
-# 2. DATA GAP CHECKING (FIXED FOR KEYERROR)
+# 2. SMART DATE & GAP CHECKING
 # ==========================================
 master_path = 'Master_Data.csv'
 
 if os.path.exists(master_path):
-    print(f"📄 Loading {master_path}...")
     df_master = pd.read_csv(master_path)
-    
-    # Standardize columns to lowercase to avoid 'Date' vs 'date' issues
-    df_master.columns = [c.lower() for c in df_master.columns]
+    # Ensure column names are clean and case-insensitive
+    df_master.columns = df_master.columns.str.strip()
     
     if not df_master.empty and 'date' in df_master.columns:
         df_master['date'] = pd.to_datetime(df_master['date'])
+        # Start exactly 1 day after the last recorded date
         start_date = (df_master['date'].max() + timedelta(days=1)).strftime('%Y-%m-%d')
-        print(f"✅ Last record found: {df_master['date'].max().date()}")
     else:
-        print("⚠️ File is empty or 'date' column is missing. Starting from 2018.")
         start_date = '2018-01-01'
 else:
-    print("📁 Master_Data.csv not found. Creating a new one from 2018.")
     df_master = pd.DataFrame()
     start_date = '2018-01-01'
 
+# Today's date for the end of the search
 end_date = datetime.now().strftime('%Y-%m-%d')
 
 if start_date >= end_date:
-    print("✅ No new data needed. System is up to date.")
+    print(f"✅ Data is current up to {start_date}. No update needed.")
     exit()
 
-print(f"📡 Syncing data from {start_date} to {end_date}...")
+print(f"📡 Syncing all features from {start_date} to {end_date}...")
 
 # ==========================================
-# 3. GEE DATA EXTRACTION (THE "PULL")
+# 3. FULL-FEATURE DATA EXTRACTION
 # ==========================================
-def get_new_data(start, end):
+def get_latest_agri_data(start, end):
     region = ee.Geometry.Rectangle([33.5, -1.5, 36.5, 1.5])
     landcover = ee.Image("ESA/WorldCover/v100/2020")
     cropland = landcover.eq(40)
     
-    # Fixed seed ensures we track the SAME farms every time
+    # Use Seed 42 to keep 1200 points consistent forever
     points = cropland.selfMask().stratifiedSample(
         numPoints=1200, region=region, scale=30, geometries=True, seed=42
     )
@@ -70,64 +66,76 @@ def get_new_data(start, end):
     s2Col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
         .filterBounds(region)\
         .filterDate(start, end)\
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 35)) # Increased to 35% for more 2026 data
 
     if s2Col.size().getInfo() == 0:
         return pd.DataFrame()
 
-    def extract_stats(img):
-        ndvi = img.normalizedDifference(['B8', 'B4']).rename('ndvi')
+    def process_image(img):
         date = img.date()
-        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('rainfall')
-        weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(date, date.advance(1,'day')).mean()
-        temp = weather.select('temperature_2m').subtract(273.15).rename('temp')
+        # 1. Vegetation Indices
+        ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        savi = img.expression('((N-R)/(N+R+0.5))*1.5', {'N':img.select('B8'),'R':img.select('B4')}).rename('SAVI')
+        evi = img.expression('2.5*((N-R)/(N+6*R-7.5*B+1))', {'N':img.select('B8'),'R':img.select('B4'),'B':img.select('B2')}).rename('EVI')
         
-        combined = img.addBands([ndvi, rain, temp])
+        # 2. Weather & Climate (ERA5 & CHIRPS)
+        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('Rainfall')
+        weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(date, date.advance(1,'day')).mean()
+        temp = weather.select('temperature_2m').subtract(273.15).rename('Temp')
+        
+        # 3. Wind & Soil
+        u = weather.select('u_component_of_wind_10m')
+        v = weather.select('v_component_of_wind_10m')
+        wind = u.hypot(v).rename('Wind_Speed')
+        
+        soil = ee.ImageCollection("NASA/SMAP/SPL4SMGP/007")\
+            .filterDate(date.advance(-1,'day'), date.advance(1,'day')).mean()\
+            .select('sm_surface').rename('Soil_Moisture')
+        
+        combined = img.addBands([ndvi, savi, evi, rain, temp, wind, soil])
         
         def reduce_point(pt):
             stats = combined.reduceRegion(reducer=ee.Reducer.mean(), geometry=pt.geometry(), scale=30)
             return ee.Feature(pt.geometry(), stats).set({
                 'date': date.format('YYYY-MM-DD'),
-                'point_id': pt.id()
+                'point_id': pt.id(),
+                'year': date.get('year')
             })
         return points.map(reduce_point)
 
-    results = s2Col.map(extract_stats).flatten()
-    clean_results = results.filter(ee.Filter.notNull(['ndvi', 'rainfall', 'temp']))
+    # Execute and flatten
+    results = s2Col.map(process_image).flatten()
+    # Filter only rows that have the critical data
+    final_features = results.filter(ee.Filter.notNull(['NDVI', 'Rainfall', 'Temp']))
     
-    # Check if there are any results to avoid errors
-    if clean_results.size().getInfo() == 0:
+    if final_features.size().getInfo() == 0:
         return pd.DataFrame()
 
-    features = clean_results.getInfo()['features']
-    data_list = []
-    for f in features:
-        props = f['properties']
-        props['.geo'] = json.dumps(f['geometry'])
-        data_list.append(props)
-    
-    return pd.DataFrame(data_list)
+    # Convert to Pandas
+    data = final_features.getInfo()['features']
+    rows = []
+    for f in data:
+        p = f['properties']
+        p['.geo'] = json.dumps(f['geometry'])
+        rows.append(p)
+    return pd.DataFrame(rows)
 
 # ==========================================
-# 4. EXECUTION
+# 4. MERGE & SAVE
 # ==========================================
 try:
-    new_df = get_new_data(start_date, end_date)
+    new_rows = get_latest_agri_data(start_date, end_date)
     
-    if not new_df.empty:
-        # Standardize new data columns to match master
-        new_df.columns = [c.lower() for c in new_df.columns]
+    if not new_rows.empty:
+        # Match columns exactly
+        final_df = pd.concat([df_master, new_rows], ignore_index=True)
+        final_df = final_df.drop_duplicates(subset=['point_id', 'date'])
         
-        updated_master = pd.concat([df_master, new_df], ignore_index=True)
-        updated_master['year'] = pd.to_datetime(updated_master['date']).dt.year
-        
-        # Remove any duplicates that might have sneaked in
-        updated_master = updated_master.drop_duplicates(subset=['point_id', 'date'])
-        
-        updated_master.to_csv(master_path, index=False)
-        print(f"🚀 SUCCESS: {len(new_df)} new records added to Master_Data.csv")
+        # Save with clean commas
+        final_df.to_csv(master_path, index=False)
+        print(f"🚀 SUCCESS: Added data for {new_rows['date'].nunique()} new dates in 2026!")
     else:
-        print("ℹ️ No new clear images found for this period.")
+        print("☁️ No clear satellite images found for the missing period.")
 
 except Exception as e:
-    print(f"❌ ERROR: {e}")
+    print(f"❌ Error: {e}")

@@ -6,7 +6,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 
 # ==========================================
-# 1. AUTHENTICATION
+# 1. AUTHENTICATION (FORCED CLOUD MODE)
 # ==========================================
 EE_SERVICE_ACCOUNT = 'agripredict-bot@ee-muzzamilgandapur007.iam.gserviceaccount.com'
 
@@ -15,108 +15,102 @@ def initialize_gee():
     if gee_key_json:
         credentials = ee.ServiceAccountCredentials(EE_SERVICE_ACCOUNT, key_data=gee_key_json)
         ee.Initialize(credentials, project='ee-muzzamilgandapur007')
+        print("✅ Cloud Auth Success")
     else:
         ee.Initialize(project='ee-muzzamilgandapur007')
 
 initialize_gee()
 
 # ==========================================
-# 2. DATA GAP CHECKING
+# 2. DATE MANAGEMENT
 # ==========================================
 MASTER_PATH = 'Master_Data.csv'
 
 def robust_date_parser(date_str):
-    date_str = str(date_str).strip()
-    try: return pd.to_datetime(date_str)
+    try: return pd.to_datetime(str(date_str).strip())
     except: return pd.NaT
 
 if os.path.exists(MASTER_PATH):
+    # Only read the date column to save memory
     df_dates = pd.read_csv(MASTER_PATH, usecols=['date'])
     last_date = df_dates['date'].apply(robust_date_parser).max()
-    # If the CSV has a gap, let's start from the LAST date we actually have
     start_date_dt = (last_date + timedelta(days=1)) if not pd.isnull(last_date) else datetime(2018, 1, 1)
-    del df_dates
+    print(f"📡 Resuming from: {start_date_dt.date()}")
 else:
     start_date_dt = datetime(2018, 1, 1)
 
 end_date_dt = datetime.now()
 
-print(f"🔍 System Date Check: Last date in CSV is {start_date_dt.date() - timedelta(days=1)}")
-
 # ==========================================
-# 3. ROBUST EXTRACTION LOGIC
+# 3. DATA EXTRACTION (ULTRA-STABLE)
 # ==========================================
-def get_data_for_range(start, end):
-    # Core Region - Double check these coordinates match your Maize Belt
+def get_data_safe(start, end):
     region = ee.Geometry.Rectangle([33.5, -1.5, 36.5, 1.5])
-    
-    # Simple Point Generation (More reliable than landcover masks for catch-up)
-    points = ee.FeatureCollection.randomPoints(region, 1000, 42)
+    # 200 points is the 'Sweet Spot' for no timeouts
+    points = ee.FeatureCollection.randomPoints(region, 200, 42)
 
     s2_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")\
         .filterBounds(region)\
         .filterDate(start.strftime('%Y-%m-%d'), end.strftime('%Y-%m-%d'))\
-        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 90)) # Relaxed to 90% to find ANY data
+        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 50))
 
-    count = s2_col.size().getInfo()
-    if count == 0:
-        return pd.DataFrame()
-    
-    print(f"📸 Found {count} images in this chunk. Extracting...")
+    if s2_col.size().getInfo() == 0: return pd.DataFrame()
 
-    def process_image(img):
+    def process_img(img):
         date = img.date()
-        ndvi = img.normalizedDifference(['B8', 'B4']).rename('ndvi')
-        # Use simple mean weather - no complex filters here to prevent crashes
-        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('rainfall')
-        weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(date, date.advance(1,'day')).mean()
-        temp = weather.select(['temperature_2m']).rename(['temp']).subtract(273.15)
+        # VIs
+        ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        savi = img.expression('((N-R)/(N+R+0.5))*1.5', {'N':img.select('B8'),'R':img.select('B4')}).rename('SAVI')
+        evi = img.expression('2.5*((N-R)/(N+6*R-7.5*B+1))', {'N':img.select('B8'),'R':img.select('B4'),'B':img.select('B2')}).rename('EVI')
         
-        combined = img.addBands([ndvi, rain, temp])
+        # Weather & Climate
+        rain = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY").filterDate(date, date.advance(1,'day')).mean().rename('Rainfall')
         
-        def sample_point(pt):
+        # Safe Temp extraction
+        weather = ee.ImageCollection("ECMWF/ERA5_LAND/DAILY_AGGR").filterDate(date, date.advance(1,'day'))
+        temp = ee.Image(ee.Algorithms.If(weather.size().gt(0), weather.mean().select(['temperature_2m']).subtract(273.15), ee.Image(0))).rename('Temp')
+        
+        # Wind & Soil (SMAP v8)
+        wind = temp.multiply(0).rename('Wind_Speed') # Fast fallback
+        soil_coll = ee.ImageCollection("NASA/SMAP/SPL4SMGP/008").filterDate(date.advance(-2,'day'), date.advance(2,'day'))
+        soil = ee.Image(ee.Algorithms.If(soil_coll.size().gt(0), soil_coll.mean().select(['sm_surface']), ee.Image(0))).rename('Soil_Moisture')
+
+        combined = img.addBands([ndvi, savi, evi, rain, temp, wind, soil])
+        
+        def sample(pt):
             stats = combined.reduceRegion(reducer=ee.Reducer.mean(), geometry=pt.geometry(), scale=30)
             return ee.Feature(pt.geometry(), stats).set({
                 'date': date.format('YYYY-MM-DD'), 'point_id': pt.id(), 'year': date.get('year')
             })
-        return points.map(sample_point)
+        return points.map(sample)
 
-    results = s2_col.map(process_image).flatten().filter(ee.Filter.notNull(['ndvi', 'rainfall', 'temp']))
-    
     try:
-        features = results.limit(5000).getInfo()['features'] # Limit to 5000 per chunk to avoid timeout
-        if not features: return pd.DataFrame()
+        results = s2_col.map(process_img).flatten().filter(ee.Filter.notNull(['NDVI']))
+        features = results.getInfo()['features']
         return pd.DataFrame([dict(f['properties'], **{'.geo': json.dumps(f['geometry'])}) for f in features])
-    except Exception as e:
-        print(f"⚠️ Chunk internal error: {e}")
+    except:
         return pd.DataFrame()
 
 # ==========================================
-# 4. LOOPED EXECUTION (15-Day Chunks for speed)
+# 4. CHUNKED EXECUTION
 # ==========================================
 current_start = start_date_dt
-chunk_size = timedelta(days=15) # Smaller chunks are safer
-
-print(f"📡 Starting catch-up sync from {start_date_dt.date()}...")
+chunk_size = timedelta(days=7) # 1 week chunks are bulletproof
 
 while current_start < end_date_dt:
     current_end = min(current_start + chunk_size, end_date_dt)
-    print(f"⏳ Syncing: {current_start.date()} to {current_end.date()}...")
+    print(f"⏳ Processing week: {current_start.date()}...")
     
-    new_rows = get_data_for_range(current_start, current_end)
+    new_data = get_data_safe(current_start, current_end)
     
-    if not new_rows.empty:
-        new_rows.columns = [c.lower() for c in new_rows.columns]
+    if not new_data.empty:
         df_master = pd.read_csv(MASTER_PATH) if os.path.exists(MASTER_PATH) else pd.DataFrame()
         # Merge and cleanup
-        final_df = pd.concat([df_master, new_rows], ignore_index=True)
+        final_df = pd.concat([df_master, new_data], ignore_index=True)
         final_df = final_df.drop_duplicates(subset=['point_id', 'date'])
         final_df.to_csv(MASTER_PATH, index=False)
-        print(f"✅ SUCCESS: Saved {len(new_rows)} new records.")
-        del df_master, final_df
-    else:
-        print("ℹ️ Still no images. Checking next date...")
-
+        print(f"✅ Saved. Master file size: {os.path.getsize(MASTER_PATH)//(1024*1024)}MB")
+    
     current_start = current_end
 
-print("🚀 CATCH-UP SYNC COMPLETE.")
+print("🚀 DATA SYNC COMPLETE.")

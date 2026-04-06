@@ -15,10 +15,10 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v3
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11' # Upgraded
+          python-version: '3.11'
 
       - name: Install Dependencies
         run: |
@@ -27,11 +27,12 @@ jobs:
       - name: Run Sync Script
         env:
           GEE_KEY: ${{ secrets.GEE_KEY }}
-        run: python sync_data.py
+        # The '|| true' ensures that even if Python fails, the next step (Save) still runs
+        run: python sync_data.py || true 
 
       - name: Save Changes to GitHub
         run: |
           git config --global user.name 'AgriPredict-Bot'
           git config --global user.email 'bot@agripredict.ai'
           git add Master_Data.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update: Satellite data added" && git push)
+          git diff --staged --quiet || (git commit -m "Auto-update: Saving progress" && git push)

@@ -36,3 +36,10 @@ jobs:
           git config --global user.email 'bot@agripredict.ai'
           git add Master_Data.csv
           git diff --staged --quiet || (git commit -m "Auto-update: Saving progress" && git push)
+          - name: 5. Save Changes to GitHub
+        run: |
+          git config --global user.name 'AgriPredict-Bot'
+          git config --global user.email 'bot@agripredict.ai'
+          git add Maizedata_1200poi_*.csv
+          # Check if there's anything to commit
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-update: Biological data for 1200 points" && git push)
